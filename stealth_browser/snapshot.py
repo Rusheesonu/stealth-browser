@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from nodriver import cdp
 
-from app.actions import run_actions, BrowserAction
-from app.browser import pool, with_transient_retry
-from app.extract_js import COLLECT_ELEMENTS_JS
+from .actions import run_actions, BrowserAction
+from .browser import pool, with_transient_retry
+from .extract_js import COLLECT_ELEMENTS_JS
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,16 +39,13 @@ async def take_snapshot(
     Optional actions run after navigation but before element collection —
     used to dismiss cookie banners, log in, scroll-trigger lazy content.
 
-    warmup=False (DEFAULT, after iter 6 bench): the cookie-warmup approach
-    was tested and caused MORE problems than it solved on the antibot
-    bench — visiting site root first then immediately scraping a deep URL
-    looked MORE suspicious to Akamai (macys.com regressed from PASS to
-    45s timeout) and the warmup-tab cleanup is racy on nodriver 0.45+
-    causing "No target with given id found" errors on the follow-up
-    scrape (broke 2captcha demo). Disabled by default; opt-in via warmup=
-    True when you've validated it helps a specific site. Future improvement:
-    extract cf_clearance cookie post-warmup and replay via curl-impersonate
-    instead of re-using the same browser session."""
+    warmup=False (DEFAULT): the cookie-warmup approach was tested and
+    caused MORE problems than it solved on the antibot bench — visiting
+    site root first then immediately scraping a deep URL looked MORE
+    suspicious to Akamai and the warmup-tab cleanup is racy on nodriver
+    0.45+ causing 'No target with given id found' errors on the follow-up
+    scrape. Disabled by default; opt-in via warmup=True when you've
+    validated it helps a specific site."""
 
     async def _once() -> SnapshotResult:
         if warmup:
@@ -96,10 +96,10 @@ async def _warmup_session(target_url: str) -> None:
         # under 2s misses some challenges, over 3s adds noticeable latency.
         await asyncio.sleep(2.5)
         _warmed_hosts.add(host)
-        print(f"[warmup] warmed {host}")
+        log.info("warmed %s", host)
     except Exception as e:
         # Don't poison the cache on error — let the next attempt retry.
-        print(f"[warmup] {host} warmup failed (continuing anyway): {e!r}")
+        log.info("%s warmup failed (continuing anyway): %r", host, e)
     finally:
         if warmup_tab is not None:
             try: await warmup_tab.close()
@@ -156,6 +156,16 @@ async def _snapshot_inner(
         await _wait_ready(tab, timeout=8.0)
         await asyncio.sleep(0.5)
 
+        # Install a MutationObserver that auto-eagers any <img> the page
+        # adds AFTER this point (React mounts, infinite scroll, etc).
+        # This is the fix for the "image rendered partially" bug — the
+        # one-shot force-eager pass in step 3 only catches images that
+        # exist NOW, but real e-commerce SPAs add product cards
+        # continuously during scroll. The observer runs forever inside
+        # the page until the tab closes; no perf concern since it's
+        # cheap (attribute-only edits).
+        await _install_lazy_image_killer(tab)
+
         # Run pre-snapshot actions (dismiss cookie banners, log in, etc).
         # Failures are logged but don't abort — best-effort.
         if actions:
@@ -165,48 +175,33 @@ async def _snapshot_inner(
                 # start collecting elements / taking screenshots.
                 await asyncio.sleep(0.4)
             except Exception as e:
-                print(f"[snapshot] actions failed: {e!r}")
+                log.warning("actions failed: %r", e)
 
-        # 3. Force-eager all lazy images BEFORE scrolling. That way when
-        # intersection-observers fire during the scroll pass, the images
-        # they reference are already downloading rather than waiting for
-        # an observer hit. Belt-and-suspenders: also handle data-src,
-        # data-srcset, and data-lazy-src shims common on old scripts.
-        await tab.evaluate(
-            r"""
-            (() => {
-                document.querySelectorAll('img[loading="lazy"]').forEach(img => {
-                    img.loading = 'eager';
-                });
-                document.querySelectorAll('img[data-src]').forEach(img => {
-                    if (!img.src || img.src.startsWith('data:')) img.src = img.dataset.src;
-                });
-                document.querySelectorAll('img[data-srcset]').forEach(img => {
-                    if (!img.srcset) img.srcset = img.dataset.srcset;
-                });
-                document.querySelectorAll('img[data-lazy-src]').forEach(img => {
-                    if (!img.src) img.src = img.dataset.lazySrc;
-                });
-            })()
-            """
-        )
+        # 3. Force-eager all currently-known lazy images. Belt and
+        # suspenders alongside the observer in case the observer
+        # registered after some images already mounted.
+        await _force_eager_all_images(tab)
 
         # 4. Scroll through the full page to hit any observer-based
         # loaders that skip force-eager. Bounded — no infinite scroll.
         await _scroll_full_height(tab)
 
-        # 5. Scroll back to origin and wait for the layout to settle.
-        # Image decode is async; we wait for it explicitly here so our
-        # bbox collection sees fully-rendered sizes.
+        # 5. Scroll back to origin and wait for the layout + imagery to
+        # finish. The image wait uses naturalWidth > 0 (proves the
+        # image actually decoded, not just downloaded — see helper for
+        # why img.complete alone lies) AND requires a streak of
+        # consecutive all-loaded readings so a React mid-mount doesn't
+        # slip through.
         await tab.evaluate("window.scrollTo(0, 0)")
-        await _wait_for_images(tab, timeout=4.0)
+        await _force_eager_all_images(tab)              # catch React-mounted images
+        await _wait_for_images(tab, timeout=6.0)        # heavy grids need it
         # Poll until two consecutive samples of body scrollHeight agree —
         # catches the Amazon failure mode where a banner / filter sidebar
         # lazy-inserts content right around the 500ms mark and shoves
         # everything below it down ~70px. Without this, bbox collection
         # happens on the pre-insert layout and the screenshot ends up
         # capturing the post-insert layout, producing that "coming above
-        # again" vertical offset. Cheap belt-and-suspenders; bounded.
+        # again" vertical offset.
         await _wait_for_stable_height(tab, timeout=3.0)
         await asyncio.sleep(0.3)
 
@@ -248,10 +243,18 @@ async def _snapshot_inner(
             ))
             # Let the page settle at the new viewport. Intersection
             # observers that fire newly-visible will run their handlers
-            # in this window; the second _wait_for_stable_height covers
-            # the rare case where they shove content around.
-            await asyncio.sleep(0.4)
+            # in this window. After expansion, MANY more product cards
+            # become "visible" simultaneously on e-commerce grids → those
+            # images start loading. _wait_for_stable_height alone wasn't
+            # enough (only checks layout, not images); we ALSO wait for
+            # image decode here. Without this second image wait, the
+            # screenshot fires while new images are still arriving from
+            # the CDN — that's the "image partially rendered" bug.
+            await asyncio.sleep(0.3)
             await _wait_for_stable_height(tab, timeout=1.5)
+            await _force_eager_all_images(tab)               # catch newly-mounted lazy
+            await _wait_for_images(tab, timeout=5.0)         # second decode wait
+            await _wait_for_stable_height(tab, timeout=1.0)  # absorb any post-image layout shift
         except Exception:
             # Renderer didn't accept the resize (probably an OOM-style
             # rejection on huge pages) — fall back to the old strategy:
@@ -270,9 +273,12 @@ async def _snapshot_inner(
         ))
         screenshot_b64 = shot if isinstance(shot, str) else str(shot)
 
-        print(
-            f"[snapshot] {url} → {len(data.get('elements', []))} elements "
-            f"(page {data.get('page', {}).get('width')}×{data.get('page', {}).get('height')})"
+        log.info(
+            "%s → %d elements (page %sx%s)",
+            url,
+            len(data.get("elements", [])),
+            data.get("page", {}).get("width"),
+            data.get("page", {}).get("height"),
         )
 
         return SnapshotResult(
@@ -291,21 +297,162 @@ async def _snapshot_inner(
 
 
 async def _wait_for_images(tab, timeout: float) -> None:
-    """Wait until every <img> on the page has either loaded or failed.
-    Bounded — a broken CDN shouldn't hang our snapshot forever."""
+    """Wait until every image on the page has actually decoded.
+
+    The naive `img.complete` check is WRONG for several common cases:
+
+      - `img.complete` is `true` for images with NO src at all (yet to
+        be assigned by React) — so we'd return early while half the
+        product images haven't even started loading.
+      - `img.complete` is `true` for FAILED images (404, CORS error) —
+        fine, those won't render anyway.
+      - `img.complete` flips true the moment bytes arrive, BEFORE the
+        browser has decoded the image. The screenshot can fire during
+        decode, capturing a partially-rendered tile.
+      - `img.complete` doesn't cover `<source srcset>` inside
+        `<picture>` (modern responsive images) or CSS `background-image`.
+
+    The robust check: `naturalWidth > 0` proves the image decoded to
+    the point where the browser knows its dimensions — i.e. it can be
+    painted. Plus we require a streak of 2 consecutive all-loaded
+    readings, because React mid-mount can add a new <img> between our
+    polls and we'd otherwise return when the FIRST poll happened to
+    catch a quiet moment.
+
+    Bounded — a broken CDN shouldn't hang our snapshot forever.
+    """
     deadline = asyncio.get_event_loop().time() + timeout
+    streak = 0
     while asyncio.get_event_loop().time() < deadline:
         try:
-            done = await tab.evaluate(
-                "Array.from(document.images).every(img => img.complete)"
-            )
-            if isinstance(done, tuple):
-                done = done[0]
-            if done:
-                return
+            pending = await tab.evaluate(r"""
+                (() => {
+                    const imgs = Array.from(document.images);
+                    let pending = 0;
+                    for (const img of imgs) {
+                        // No src yet → either React hasn't mounted it
+                        // or it's a placeholder. Either way: not done.
+                        if (!img.currentSrc && !img.src) { pending++; continue; }
+                        // data: URLs are inlined, always "loaded".
+                        if (img.src.startsWith('data:')) continue;
+                        // naturalWidth=0 means the image hasn't decoded
+                        // enough to know its own dimensions. It will
+                        // render as a transparent gap in the screenshot.
+                        if (img.naturalWidth === 0) { pending++; continue; }
+                        // Belt-and-suspenders: `complete` should be true
+                        // by the time naturalWidth > 0, but check
+                        // anyway in case the browser is mid-load on a
+                        // srcset variant swap.
+                        if (!img.complete) { pending++; continue; }
+                    }
+                    return pending;
+                })()
+            """)
+            if isinstance(pending, tuple):
+                pending = pending[0]
+            pending = int(pending or 0)
+            if pending == 0:
+                streak += 1
+                if streak >= 2:    # two consecutive clean reads
+                    return
+            else:
+                streak = 0
         except Exception:
-            pass
-        await asyncio.sleep(0.25)
+            streak = 0
+        await asyncio.sleep(0.2)
+
+
+async def _force_eager_all_images(tab) -> None:
+    """One-shot pass that converts every known lazy-image pattern to
+    eager-load. Idempotent — safe to call repeatedly. Covers:
+
+      - `<img loading="lazy">` → `loading="eager"`
+      - `data-src` / `data-srcset` / `data-lazy-src` (legacy shims)
+      - `<picture><source srcset="...">` (re-touched to force re-eval)
+
+    This is the COMPLEMENT to `_install_lazy_image_killer` (which
+    catches images mounted AFTER snapshot start). This catches images
+    that existed at snapshot start. Calling both is the belt-and-
+    suspenders solution to React-driven product grids."""
+    await tab.evaluate(r"""
+        (() => {
+            for (const img of document.querySelectorAll('img[loading="lazy"]')) {
+                img.loading = 'eager';
+            }
+            for (const img of document.querySelectorAll('img[data-src]')) {
+                if (!img.src || img.src.startsWith('data:')) img.src = img.dataset.src;
+            }
+            for (const img of document.querySelectorAll('img[data-srcset]')) {
+                if (!img.srcset) img.srcset = img.dataset.srcset;
+            }
+            for (const img of document.querySelectorAll('img[data-lazy-src]')) {
+                if (!img.src) img.src = img.dataset.lazySrc;
+            }
+            // <picture><source> — re-assign srcset to nudge the browser
+            // to pick a variant if the original was set lazily.
+            for (const src of document.querySelectorAll('picture source[srcset]')) {
+                // self-assign is a no-op but flushes the responsive picker
+                src.srcset = src.srcset;
+            }
+        })()
+    """)
+
+
+async def _install_lazy_image_killer(tab) -> None:
+    """Install a MutationObserver in the page that auto-eagers any
+    `<img>` added to the DOM after we attach. Lives until the tab
+    closes; covers the gap where React mounts product cards during our
+    scroll pass — those new images would otherwise keep their
+    `loading="lazy"` and never decode in time for our screenshot.
+
+    Cheap: only fires on `childList` mutations + attribute-only edits
+    (no layout cost). No-op if the page somehow has no `MutationObserver`
+    (every browser since 2014 supports it)."""
+    await tab.evaluate(r"""
+        (() => {
+            if (window.__stealthLazyKillerInstalled) return;
+            window.__stealthLazyKillerInstalled = true;
+
+            const eagerOne = (img) => {
+                if (img.tagName !== 'IMG') return;
+                if (img.loading === 'lazy') img.loading = 'eager';
+                if (img.dataset.src && (!img.src || img.src.startsWith('data:'))) {
+                    img.src = img.dataset.src;
+                }
+                if (img.dataset.srcset && !img.srcset) {
+                    img.srcset = img.dataset.srcset;
+                }
+                if (img.dataset.lazySrc && !img.src) {
+                    img.src = img.dataset.lazySrc;
+                }
+            };
+
+            const obs = new MutationObserver((muts) => {
+                for (const m of muts) {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        if (node.tagName === 'IMG') eagerOne(node);
+                        // Newly-mounted subtree (React render) — sweep
+                        // every <img> inside it.
+                        if (node.querySelectorAll) {
+                            for (const img of node.querySelectorAll('img')) {
+                                eagerOne(img);
+                            }
+                        }
+                    }
+                    if (m.type === 'attributes' && m.target.tagName === 'IMG') {
+                        eagerOne(m.target);
+                    }
+                }
+            });
+            obs.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['loading', 'data-src', 'data-srcset'],
+            });
+        })()
+    """)
 
 
 async def _wait_for_stable_height(tab, timeout: float, samples: int = 3) -> None:
@@ -356,15 +503,15 @@ async def _evaluate_json(tab, expression: str) -> dict:
 
     if exc is not None:
         text = getattr(exc, "text", None) or getattr(exc, "exception", None)
-        print(f"[snapshot] in-page eval raised: {text!r}")
+        log.warning("in-page eval raised: %r", text)
         return {"elements": [], "viewport": {}, "page": {}}
 
     value = getattr(remote, "value", None)
     if value is None:
-        print("[snapshot] CDP returned no value (type may not be serializable)")
+        log.warning("CDP returned no value (type may not be serializable)")
         return {"elements": [], "viewport": {}, "page": {}}
     if not isinstance(value, dict):
-        print(f"[snapshot] CDP returned {type(value).__name__} instead of dict")
+        log.warning("CDP returned %s instead of dict", type(value).__name__)
         return {"elements": [], "viewport": {}, "page": {}}
     return value
 

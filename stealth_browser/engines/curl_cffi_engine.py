@@ -208,7 +208,7 @@ class CurlCffiEngine:
         IP-reputation-sensitive vendor AND a residential plan is
         configured; otherwise falls back to the datacenter pool."""
         try:
-            from app import proxies
+            from .. import proxies
             return proxies.pick_for_vendor(vendor_hint)
         except Exception:
             return None

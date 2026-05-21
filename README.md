@@ -6,16 +6,20 @@
 [![Python](https://img.shields.io/pypi/pyversions/stealth-browser.svg)](https://pypi.org/project/stealth-browser/)
 
 ```python
+import asyncio
 from stealth_browser.engines import router, Requirements
 
-snap, decision = await router.snapshot(
-    "https://www.crunchbase.com/",
-    requirements=Requirements(needs_js=True, vendor_hint="cloudflare"),
-)
-print(f"engine used: {snap.engine_name}")    # → "nodriver"
-print(f"elements:    {len(snap.elements)}")  # → 717
-print(f"router:      {decision.reason}")
-# → "chose 'nodriver'; vendor-affinity rank 1/2 for cloudflare; cost 1c"
+async def main():
+    snap, decision = await router.snapshot(
+        "https://www.crunchbase.com/",
+        requirements=Requirements(needs_js=True, vendor_hint="cloudflare"),
+    )
+    print(f"engine used: {snap.engine_name}")    # → "nodriver"
+    print(f"elements:    {len(snap.elements)}")  # → 717
+    print(f"router:      {decision.reason}")
+    # → "chose 'nodriver'; vendor-affinity rank 1/2 for cloudflare; cost 1c"
+
+asyncio.run(main())
 ```
 
 No single browser-automation library beats every anti-bot vendor. The
@@ -259,6 +263,9 @@ stealth_browser/
 │                           wrap
 ├── stealth.py            # 20+ fingerprint patches as a single JS init
 │                           script (for use with vanilla nodriver too)
+├── actions.py            # click / fill / scroll / wait helpers
+├── extract_js.py         # in-page element-catalog JS payload
+├── proxies.py            # datacenter + residential proxy pool helpers
 ├── safety.py             # robots.txt + per-host token-bucket rate limit
 └── detect.py             # Anti-bot wall signature library (6 vendors)
 ```
@@ -315,8 +322,7 @@ include a bench delta won't merge.
 
 ## See also
 
-- [**Rusheesonu/Stealth-Scraper**](https://github.com/Rusheesonu/Stealth-Scraper) — the full hosted product (visual picker, AI assist, SDKs, MCP server, billing). Uses this package as the engine layer.
+- [**Rusheesonu/Stealth-Scraper**](https://github.com/Rusheesonu/Stealth-Scraper) — the full hosted product (visual picker, AI assist, SDKs, billing). Uses this package as the engine layer.
 - [**stealthscraper.dev**](https://stealthscraper.dev) — the SaaS frontend. Free tier, no card.
-- [**MCP server**](https://github.com/Rusheesonu/stealth-scraper-mcp) — use Stealth-Scraper from Claude Desktop / Cursor / agentic IDEs via Anthropic's Model Context Protocol.
 
 Built by [@rushikeshsonu](https://x.com/rushikeshsonu). Questions, paid integrations, hire me to scrape your target: `rushikeshsonu@gmail.com`.

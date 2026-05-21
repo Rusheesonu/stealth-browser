@@ -2,7 +2,7 @@
 
 The thesis: no single browser-automation library is best at every site.
 nodriver gets Cloudflare-easy but flakes on Cloudflare-hard. Playwright
-+ patches gets DataDome but bloats RAM. curl-impersonate-via-curl_cffi
++ patches gets DataDome but bloats RAM. curl-impersonate via curl_cffi
 beats Akamai TLS-fingerprinting at 50x the speed of any browser BUT
 can't render JS. camoufox is the only thing that beats creepjs.
 
@@ -13,25 +13,18 @@ Layout:
     engines/
     ├── __init__.py         ← public surface (Engine, Router, Capability)
     ├── base.py             ← Engine Protocol, Requirements + EngineSnapshotResult
-    ├── nodriver_engine.py  ← wraps existing app.snapshot.take_snapshot
+    ├── nodriver_engine.py  ← wraps stealth_browser.snapshot.take_snapshot
     ├── curl_cffi_engine.py ← TLS-impersonating HTTP (no JS execution)
     ├── camoufox_engine.py  ← patched Firefox — beats CreepJS, Kasada
     └── router.py           ← rule-based + learning-augmented dispatcher
 
 Usage:
-    from app.engines import router, Requirements
+    from stealth_browser.engines import router, Requirements
     result, decision = await router.snapshot(url, requirements=Requirements(
         needs_js=True, vendor_hint="cloudflare",
     ))
-    # router picks the cheapest engine satisfying requirements + with
+    # Router picks the cheapest engine satisfying requirements + with
     # historical track record on this URL/vendor, escalates on failure.
-
-Current call sites:
-    bench/lib.py:scrape_one — every benchmark scrape goes through the router.
-    bench/fingerprint.py    — uses vendor_hint="fingerprint-test" → camoufox first.
-    main.py                 — NOT yet wired (still calls take_snapshot directly).
-                              When we wire production, the rollout is gated so
-                              we don't risk regression. See AUDIT.md.
 
 Why a Protocol not an ABC: keeps duck-typing flexible, makes mocking
 easier in tests, lets us add engines from external packages without

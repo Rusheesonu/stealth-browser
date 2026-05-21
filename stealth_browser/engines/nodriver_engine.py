@@ -1,9 +1,8 @@
-"""nodriver-based engine — wraps the existing take_snapshot.
+"""nodriver-based engine — wraps the package's take_snapshot.
 
-This is the BASELINE engine that powers production today. The router
-treats it as one option among many; it's also the only engine production
-currently calls directly (main.py imports take_snapshot, not router).
-The bench is the first caller that actually goes through the router.
+The baseline engine. Drives a single shared Chromium pool via nodriver
++ CDP. Always available when nodriver is installed (which is a hard
+dependency of this package).
 
 Capabilities declared honestly:
   ✓ JS_EXEC                  — Chromium runs page JS
@@ -19,11 +18,10 @@ Capabilities declared honestly:
   ✗ HEADED                   — runs --headless=new
   ✗ MOBILE_EMULATION         — could add via CDP Emulation but not exposed here
 
-Cost: 1¢/page bucket. Actual compute cost on Lightsail is ~0.0001¢ but
-the cents-int unit doesn't represent fractions; 1 is the smallest
-ranking unit and reserves room for free engines (curl_cffi=0) to rank
-strictly cheaper. Don't read absolute values; the router only uses
-these for ordinal comparison.
+Cost: 1¢/page bucket. Cost values are ordinal, not absolute; 1 is the
+smallest ranking unit and reserves room for free engines (curl_cffi=0)
+to rank strictly cheaper. Don't read absolute values; the router only
+uses these for ordinal comparison.
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ from .base import (
 
 
 class NodriverEngine:
-    """Concrete engine wrapping app.snapshot.take_snapshot."""
+    """Concrete engine wrapping stealth_browser.snapshot.take_snapshot."""
 
     name = "nodriver"
     capabilities = (
@@ -69,9 +67,9 @@ class NodriverEngine:
         requirements: Requirements,
     ) -> EngineSnapshotResult:
         """Drive production take_snapshot, normalize to EngineSnapshotResult."""
-        # Local imports — keeps engine module light if app.snapshot has
-        # heavy deps not needed by other engines.
-        from app.snapshot import take_snapshot
+        # Local imports — keeps engine module light if the snapshot module
+        # has heavy deps not needed by other engines.
+        from ..snapshot import take_snapshot
 
         viewport_w = 390 if requirements.needs_mobile_ui else 1440
         viewport_h = 844 if requirements.needs_mobile_ui else 900
@@ -114,17 +112,16 @@ class NodriverEngine:
         # Try to capture current proxy label for telemetry — best-effort.
         proxy_label = None
         try:
-            from app.browser import pool
+            from ..browser import pool
             proxy_label = pool.current_proxy_label()
         except Exception:
             pass
 
-        # Zero-element escalation (iter 13, surgical version of iter 11
-        # attempt). The iter-11 ≤2 threshold over-escalated on legit
-        # minimal pages (httpbin.org/html). The fix: only escalate when
-        # elements is EXACTLY 0 — that means the page LITERALLY had no
-        # DOM. Any real page (example.com 3 elem, httpbin.org/html >=2
-        # elem) is unaffected.
+        # Zero-element escalation. A ≤2 threshold over-escalated on legit
+        # minimal pages (httpbin.org/html). We only escalate when elements
+        # is EXACTLY 0 — that means the page LITERALLY had no DOM. Any
+        # real page (example.com 3 elem, httpbin.org/html >=2 elem) is
+        # unaffected.
         #
         # The case this catches: Chromium-specific anti-bot detection
         # that lets the page navigate but refuses to render content

@@ -221,11 +221,11 @@ class CamoufoxEngine:
                 # this wait, the LLM judge reads the "computing..." state
                 # instead of the verdict.
                 #
-                # Iter 12 tried `asyncio.sleep(6)` here — it killed
-                # camoufox's websocket keepalive ("Browser.close" on 6/9
-                # sites). Fix: use Playwright-native `page.wait_for_timeout`
-                # which keeps the connection alive (it's a yield inside
-                # the page's event loop, not a Python-level sleep).
+                # `asyncio.sleep(6)` here killed camoufox's websocket
+                # keepalive ("Browser.close" on most fingerprint-test sites).
+                # Use Playwright-native `page.wait_for_timeout` which keeps
+                # the connection alive (it's a yield inside the page's
+                # event loop, not a Python-level sleep).
                 if requirements.vendor_hint == "fingerprint-test":
                     try:
                         await page.wait_for_timeout(6000)
@@ -252,8 +252,8 @@ class CamoufoxEngine:
                 retriable_on_other_engine=True,
             ) from e
 
-        # NOTE: tried suspicious-empty escalation here in iter 11. Reverted —
-        # the persistent-failure sites (g2.com, hyatt.com, crunchbase-discover)
+        # NOTE: tried suspicious-empty escalation here. Reverted — the
+        # persistent-failure sites (g2.com, hyatt.com, crunchbase-discover)
         # returned ≤2 elements on BOTH engines, so escalation just added
         # latency without recovering any sites. See nodriver_engine.py.
 
@@ -292,7 +292,7 @@ class CamoufoxEngine:
         Picks residential when vendor_hint is in the IP-rep-sensitive set
         and a residential plan is configured; otherwise datacenter."""
         try:
-            from app import proxies
+            from .. import proxies
             url = proxies.pick_for_vendor(vendor_hint)
             if not url:
                 return None

@@ -11,27 +11,31 @@ hot for the process lifetime. Per-request we open a fresh Tab, inject
 stealth via CDP `addScriptToEvaluateOnNewDocument` so it runs before
 any page JS on every nav, then navigate + screenshot + close tab.
 
-Proxies: if `backend/data/proxies.json` is populated, the pool picks a
-random proxy at browser-start time. Auth challenges are auto-answered
-via CDP `Fetch.authRequired` so Chromium doesn't hang on the basic-auth
-dialog. On restart (transient error path) we rotate to a new proxy.
+Proxies: if a proxy config is provided via env (PROXIES_JSON +
+PROXIES_ENABLED=true) or an on-disk file, the pool picks a random
+proxy at browser-start time. Auth challenges are auto-answered via CDP
+`Fetch.authRequired` so Chromium doesn't hang on the basic-auth dialog.
+On restart (transient error path) we rotate to a new proxy.
 
 Resilience: nodriver has well-known transient errors (StopIteration in
 its CDP cleanup coroutine, target crashed, websocket closed) that
 happen on healthy browsers under timing races. We detect by error
-string and restart+retry once.
+string and restart+retry up to N times.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Optional
 
 import nodriver as uc
 from nodriver import cdp
 
-from app import proxies
-from app.stealth import ULTRA_STEALTH_CHROMIUM_ARGS, ULTRA_STEALTH_JS
+from . import proxies
+from .stealth import ULTRA_STEALTH_CHROMIUM_ARGS, ULTRA_STEALTH_JS
+
+log = logging.getLogger(__name__)
 
 
 _TRANSIENT_ERROR_MARKERS = (
@@ -41,6 +45,14 @@ _TRANSIENT_ERROR_MARKERS = (
     "Connection closed",
     "connection closed",
     "websocket",
+    # nodriver 0.45.1+ regression on Cloudflare-protected pages — the
+    # tab's CDP session sometimes dies mid-load and any subsequent
+    # tab.send / tab.evaluate raises this. Per upstream issue #2181 the
+    # only mitigation is retry-with-fresh-tab.
+    "Session with given id not found",
+    "ProtocolException",
+    # nodriver async-cancel path under heavy use
+    "Invalid search result range",
 )
 
 
@@ -78,10 +90,10 @@ class BrowserPool:
             # which would 502 on tab init.
             args.append("--proxy-bypass-list=<-loopback>;127.0.0.1;localhost")
             self._current_proxy = proxy
-            print(f"[browser] starting with proxy {host}:{port}")
+            log.info("starting with proxy %s:%s", host, port)
         else:
             self._current_proxy = None
-            print("[browser] starting without proxy (direct)")
+            log.info("starting without proxy (direct)")
 
         self._browser = await uc.start(browser_args=args)
 
@@ -107,12 +119,23 @@ class BrowserPool:
         rotate_proxy=True picks a new proxy from the pool (default — gives us
         a fresh egress IP each restart, which is half the point of having
         a proxy pool). Pass False to keep the same proxy if you're sure the
-        error wasn't IP-related."""
+        error wasn't IP-related.
+
+        Also clears the warmed-hosts cache because the new browser will
+        have an empty cookie jar — any "cf_clearance valid" cache
+        assumptions are invalid post-restart."""
         await self.stop()
         new_proxy: Optional[ProxyTuple] = None
         if rotate_proxy and proxies.available():
             new_proxy = proxies.host_port_user_pass()
         await self.start(proxy=new_proxy)
+        # Local import to avoid circular dependency (snapshot.py imports
+        # from browser.py).
+        try:
+            from .snapshot import reset_warmup_cache
+            reset_warmup_cache()
+        except ImportError:
+            pass
 
     # ── health / liveness ─────────────────────────────────────────────────
 
@@ -192,10 +215,8 @@ class BrowserPool:
         nodriver 0.50.x API: the Browser object IS the CDP transport —
         use `browser.send(cdp_cmd)` and `browser.add_handler(EventType,
         callback)` directly. Earlier nodriver releases exposed a separate
-        `.connection` attribute; we used to look that up via getattr and
-        bail when it was None, which silently disabled all proxy auth on
-        modern nodriver. Hence the long-running "proxy logs say 'starting
-        with proxy X' but every scrape times out" bug. Fixed 2026-05-21.
+        `.connection` attribute; on modern nodriver looking that up via
+        getattr silently disabled all proxy auth, so we now call directly.
 
         Best-effort: if any of the CDP calls fail (unsupported API,
         timing race, etc.), we log + fall through. The proxy will still
@@ -209,7 +230,7 @@ class BrowserPool:
             # request — that would tank performance).
             await self._browser.send(cdp.fetch.enable(handle_auth_requests=True))
         except Exception as e:
-            print(f"[browser] cdp.fetch.enable failed: {e!r} — proxy auth NOT wired")
+            log.warning("cdp.fetch.enable failed: %r — proxy auth NOT wired", e)
             return
 
         async def _on_auth(event) -> None:
@@ -225,7 +246,7 @@ class BrowserPool:
                     )
                 )
             except Exception as e:
-                print(f"[browser] continue_with_auth failed: {e!r}")
+                log.warning("continue_with_auth failed: %r", e)
 
         async def _on_paused(event) -> None:
             # We enabled auth-only interception, but defensively handle any
@@ -244,9 +265,9 @@ class BrowserPool:
                 cdp.fetch.RequestPaused,
                 lambda evt: asyncio.create_task(_on_paused(evt)),
             )
-            print(f"[browser] proxy auth handler registered ({user}@{self.current_proxy_label()})")
+            log.info("proxy auth handler registered (%s@%s)", user, self.current_proxy_label())
         except Exception as e:
-            print(f"[browser] add_handler failed: {e!r} — proxy auth NOT wired")
+            log.warning("add_handler failed: %r — proxy auth NOT wired", e)
 
 
 pool = BrowserPool()
@@ -261,12 +282,6 @@ async def with_transient_retry(op, *, label: str = "op", max_retries: int = 3):
     is the failure-to-bind-CDP-port-during-Chromium-boot case), restart
     the browser and retry up to `max_retries` times with linear backoff.
 
-    Bench (2026-05-21) showed that single-retry was insufficient: on a
-    local 12-URL antibot run, 3/8 protected URLs failed with the WebSocket
-    500 error. The same flake usually clears within 1-3s when Chromium
-    fully releases the port. With max_retries=3 + 2s backoff, those 3
-    failures should drop to ~0.
-
     Non-transient errors (timeouts, real navigation failures, anything
     that's not in _TRANSIENT_ERROR_MARKERS) propagate on first raise —
     we don't want to mask real bugs by retrying everything."""
@@ -280,17 +295,23 @@ async def with_transient_retry(op, *, label: str = "op", max_retries: int = 3):
             last_err = e
             if attempt >= max_retries:
                 # Out of retries — surface the final error
-                print(f"[{label}] transient nodriver error persisted after {max_retries + 1} attempts: {e!r}")
+                log.warning(
+                    "[%s] transient nodriver error persisted after %d attempts: %r",
+                    label, max_retries + 1, e,
+                )
                 raise
             backoff = 2.0 * (attempt + 1)    # 2s, 4s, 6s — linear, not exponential
-            print(f"[{label}] transient flake (attempt {attempt + 1}/{max_retries + 1}): {e!r} — restart+rotate, retry in {backoff}s")
+            log.info(
+                "[%s] transient flake (attempt %d/%d): %r — restart+rotate, retry in %.1fs",
+                label, attempt + 1, max_retries + 1, e, backoff,
+            )
             try:
                 await pool.restart(rotate_proxy=True)
                 await asyncio.sleep(backoff)
             except Exception as restart_err:
                 # If restart itself flakes, log and continue — the next
                 # op() call will attempt its own lazy start.
-                print(f"[{label}] restart also flaked: {restart_err!r} — falling through to retry")
+                log.warning("[%s] restart also flaked: %r — falling through to retry", label, restart_err)
                 await asyncio.sleep(backoff)
     # Unreachable — the loop either returns or raises — but mypy wants it.
     if last_err:
