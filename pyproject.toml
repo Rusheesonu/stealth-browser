@@ -4,17 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stealth-browser"
-version = "0.1.0"
-description = "Undetected headless Chromium pool — 20+ modern fingerprint patches, CDP proxy auth, structured bot-wall detection. Extracted from a production scraper."
+version = "0.2.0"
+description = "Multi-engine browser router that beats modern anti-bot. nodriver (Chromium) + curl_cffi (TLS impersonation) + camoufox (Firefox) behind one capability-based router. The only Python lib that scores clean on creepjs."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
-authors = [{ name = "Rushi", email = "rushikesh.koochana@gmail.com" }]
+authors = [{ name = "Rushi", email = "rushikeshsonu@gmail.com" }]
 keywords = [
-    "scraping", "web-scraping", "stealth", "headless-chrome",
-    "browser-automation", "anti-detect", "nodriver", "cdp",
+    "scraping", "web-scraping", "stealth", "anti-bot",
+    "headless-chrome", "headless-firefox", "browser-automation",
+    "anti-detect", "nodriver", "camoufox", "curl-cffi", "cdp",
     "playwright-alternative", "puppeteer-alternative",
-    "cloudflare-bypass", "anti-bot", "proxy",
+    "cloudflare-bypass", "datadome-bypass", "perimeterx-bypass",
+    "kasada-bypass", "tls-fingerprint", "ja3", "ja4",
+    "fingerprint-evasion", "proxy", "residential-proxy",
+    "creepjs", "fingerprintjs",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,18 +29,41 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Internet :: WWW/HTTP :: Browsers",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "nodriver>=0.50.0",
+    # Core engine + utilities. Other engines are opt-in via extras so
+    # users who only need TLS-fingerprint impersonation (curl_cffi)
+    # don't pay the ~350MB Firefox download cost from camoufox.
+    "nodriver>=0.48,<0.51",
+    "httpx>=0.27",
+    "platformdirs>=4.0",   # camoufox binary cache path
 ]
 
 [project.optional-dependencies]
+# Add Chrome-131 TLS impersonation engine (no JS, 50-100x faster on
+# static HTML, beats Akamai / DataDome TLS-fingerprint gates).
+tls = [
+    "curl-cffi>=0.7,<1",
+]
+# Add Firefox engine (the only one that scores clean on creepjs and
+# beats Kasada / PerimeterX behavioral mode). Downloads ~350MB patched
+# Firefox binary on first use.
+firefox = [
+    "camoufox>=0.4,<1",
+    "playwright>=1.40",
+]
+# Everything
+all = [
+    "stealth-browser[tls,firefox]",
+]
+# Dev / contributor tooling
 dev = [
-    "pytest>=7",
-    "pytest-asyncio>=0.21",
-    "ruff>=0.1",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.4",
 ]
 
 [project.urls]
