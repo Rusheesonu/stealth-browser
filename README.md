@@ -2,8 +2,13 @@
 
 **A multi-engine browser router that beats modern anti-bot vendors.**
 
-[![PyPI](https://img.shields.io/pypi/v/stealth-browser.svg)](https://pypi.org/project/stealth-browser/)
-[![Python](https://img.shields.io/pypi/pyversions/stealth-browser.svg)](https://pypi.org/project/stealth-browser/)
+[![Tests](https://github.com/Rusheesonu/stealth-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/Rusheesonu/stealth-browser/actions)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
+![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)
+
+> **v0.2.0 — Beta.** PyPI release coming with the Product Hunt launch
+> (June 1, 2026). Until then, install from git (one-line, works today).
 
 ```python
 import asyncio
@@ -56,14 +61,26 @@ for the methodology and reproducible commands.
 
 ## Install
 
+**During beta (before PyPI release):**
+
 ```bash
-# Core: just the router + nodriver engine
+# Core install — works today via git+https. Both pip and uv understand it.
+pip install git+https://github.com/Rusheesonu/stealth-browser.git
+
+# With optional engines:
+pip install 'stealth-browser[tls,firefox] @ git+https://github.com/Rusheesonu/stealth-browser.git'
+```
+
+**Once PyPI publish lands (~ June 1, 2026):**
+
+```bash
+# Core: router + nodriver engine
 pip install stealth-browser
 
-# Add the curl_cffi engine (real-Chrome TLS impersonation, no JS)
+# + Chrome-131 TLS-impersonation engine (no JS, 50-100x faster on static HTML)
 pip install 'stealth-browser[tls]'
 
-# Add the camoufox engine (patched Firefox; 350MB binary download on first use)
+# + Patched Firefox engine (the only one clean on creepjs, 350MB first-run download)
 pip install 'stealth-browser[firefox]'
 
 # Everything
