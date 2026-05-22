@@ -61,20 +61,8 @@ for the methodology and reproducible commands.
 
 ## Install
 
-**During beta (before PyPI release):**
-
 ```bash
-# Core install — works today via git+https. Both pip and uv understand it.
-pip install git+https://github.com/Rusheesonu/stealth-browser.git
-
-# With optional engines:
-pip install 'stealth-browser[tls,firefox] @ git+https://github.com/Rusheesonu/stealth-browser.git'
-```
-
-**Once PyPI publish lands (~ June 1, 2026):**
-
-```bash
-# Core: router + nodriver engine
+# Core: router + nodriver engine (Chromium via patched CDP)
 pip install stealth-browser
 
 # + Chrome-131 TLS-impersonation engine (no JS, 50-100x faster on static HTML)
@@ -86,6 +74,8 @@ pip install 'stealth-browser[firefox]'
 # Everything
 pip install 'stealth-browser[all]'
 ```
+
+Available on PyPI: https://pypi.org/project/stealth-browser/
 
 Requires Python 3.10+. `nodriver` needs a real Chrome/Chromium installed
 locally (`brew install --cask google-chrome` on macOS). `camoufox`
